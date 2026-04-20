@@ -5,8 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "invoice-ocr"
 version = "0.1.0"
-description = "Local OCR invoice project"
+description = "Production OCR invoice project"
 requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.7,<3.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
