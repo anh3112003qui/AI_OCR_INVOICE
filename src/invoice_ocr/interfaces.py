@@ -1,26 +1,60 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from invoice_ocr.models import InvoiceData, OCRResult
 from invoice_ocr.types import ImagePath
 
 
+@runtime_checkable
 class OCRProvider(Protocol):
-    """Read invoice image and return normalized OCR output."""
+    """
+    Contract for any OCR provider (Gemini, Azure, Tesseract, etc.)
 
-    name: str
+    Any class implementing this interface must:
+    - Declare instance attribute `name` via __init__
+    - Implement `read_image` to return a normalized OCRResult
+    """
+
+    def __init__(self, name: str) -> None:
+        # Unique identifier for this provider (e.g. "gemini", "azure")
+        self.name = name
 
     def read_image(self, image_path: ImagePath) -> OCRResult:
-        """Read a single image and return normalized OCR result."""
+        """
+        Read an invoice image and return normalized OCR output.
+
+        Args:
+            image_path: path to the image file (str or Path)
+
+        Returns:
+            OCRResult containing raw_text and provider metadata
+        """
         ...
 
 
+@runtime_checkable
 class FieldExtractor(Protocol):
-    """Extract structured invoice fields from OCR result."""
+    """
+    Contract for extracting structured invoice fields from OCR output.
 
-    name: str
+    Any class implementing this interface must:
+    - Declare instance attribute `name` via __init__
+    - Implement `extract_invoice` to return a normalized InvoiceData
+    """
+
+    def __init__(self, name: str) -> None:
+        # Unique identifier for this extractor, used for logging and debugging
+        self.name = name
 
     def extract_invoice(self, ocr_result: OCRResult) -> InvoiceData:
-        """Convert OCR result into normalized invoice data."""
+        """
+        Extract business fields from an OCR result.
+
+        Args:
+            ocr_result: output from an OCRProvider containing raw_text
+
+        Returns:
+            InvoiceData with parsed and normalized invoice fields
+        """
         ...

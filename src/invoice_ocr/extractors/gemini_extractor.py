@@ -1,28 +1,68 @@
 from __future__ import annotations
 
-import base64
-import mimetypes
-import time
-from pathlib import Path
+import json
+from datetime import date
+from decimal import Decimal
 from typing import Any
 
 import httpx
 
 from invoice_ocr.config import GeminiSettings
-from invoice_ocr.models import OCRResult
-from invoice_ocr.types import ImagePath
+from invoice_ocr.models import InvoiceData, InvoiceLineItem, OCRResult
 
-# Default MIME type used when file extension cannot be detected
-_DEFAULT_MIME_TYPE = "image/jpeg"
+# Prompt instructing Gemini to extract structured fields from raw OCR text
+_EXTRACTION_PROMPT = """
+You are an invoice data extraction engine for Vietnamese VAT invoices.
+
+Extract all structured fields from the raw OCR text below and return a single JSON object.
+Do NOT include any explanation, markdown, or commentary — return raw JSON only.
+
+Required JSON schema:
+{{
+  "ngay_hd": "YYYY-MM-DD or null",
+  "so_hd": "string or null",
+  "mst_ncc": "string or null",
+  "ten_ncc_raw": "string or null",
+  "ma_ncc": null,
+  "line_items": [
+    {{
+      "ten_vt_raw": "string or null",
+      "dvt": "string or null",
+      "so_luong": number or null,
+      "don_gia": number or null,
+      "thue_suat_pct": number or null,
+      "ma_vt": null,
+      "ma_thue": null,
+      "tk_kho": null,
+      "ma_bp": null,
+      "ma_da": null,
+      "ghi_chu": null
+    }}
+  ]
+}}
+
+Rules:
+- ngay_hd must be normalized to YYYY-MM-DD format.
+- so_hd is the invoice number (e.g. 0000087).
+- mst_ncc is the supplier tax ID (10 or 13 digits, digits only, no spaces).
+- ten_ncc_raw is the supplier name exactly as printed.
+- so_luong and don_gia are plain numbers, no thousand separators or units.
+- thue_suat_pct is a plain number (e.g. 8, 10, 5, 0) — not a percentage string.
+- ma_ncc, ma_vt, ma_thue, tk_kho, ma_bp, ma_da must always be null — do not guess.
+- If a field cannot be found, set it to null.
+
+Raw OCR text:
+{raw_text}
+"""
 
 
-class GeminiProvider:
+class GeminiFieldExtractor:
     """
-    OCR provider adapter for the Gemini Vision API.
+    Field extractor implementation using the Gemini API.
 
-    Implements the OCRProvider interface.
-    Responsible only for reading an image and returning raw OCR text.
-    Config loading is handled externally and injected via __init__.
+    Implements the FieldExtractor interface.
+    Sends raw OCR text to Gemini with a structured prompt and parses
+    the JSON response into an InvoiceData object.
     """
 
     _BASE_URL = "https://generativelanguage.googleapis.com/v1"
@@ -31,75 +71,83 @@ class GeminiProvider:
     _INITIAL_BACKOFF_SECONDS = 1.5
 
     def __init__(self, settings: GeminiSettings) -> None:
-        # Unique identifier for this provider, used for logging and OCRResult
-        self.name = "gemini"
+        # Unique identifier for this extractor, used for logging and debugging
+        self.name = "gemini_extractor"
         self._settings = settings
 
-    def read_image(self, image_path: ImagePath) -> OCRResult:
+    def extract_invoice(self, ocr_result: OCRResult) -> InvoiceData:
         """
-        Read an invoice image and return normalized OCR output.
+        Extract structured invoice fields from OCR output.
 
         Args:
-            image_path: path to the image file (str or Path)
+            ocr_result: output from an OCRProvider containing raw_text
 
         Returns:
-            OCRResult containing raw_text and provider metadata
+            InvoiceData with parsed header fields and line items
         """
-        path = Path(image_path)
+        if not ocr_result.raw_text.strip():
+            raise ValueError("OCR result contains no text to extract from.")
 
-        if not path.exists():
-            raise FileNotFoundError(f"Image file not found: {path}")
-
-        if not path.is_file():
-            raise ValueError(f"Input path is not a file: {path}")
-
-        image_bytes = path.read_bytes()
-        if not image_bytes:
-            raise ValueError(f"Image file is empty: {path}")
-
-        mime_type = self._resolve_mime_type(path)
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
+        prompt = _EXTRACTION_PROMPT.format(raw_text=ocr_result.raw_text)
         payload = {
             "contents": [
                 {
-                    "parts": [
-                        {
-                            "text": (
-                                "You are an OCR engine for invoices. "
-                                "Extract all visible text from this image as faithfully as possible. "
-                                "Return plain text only. Preserve line breaks where helpful. "
-                                "Do not add explanations, markdown, or commentary."
-                            )
-                        },
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": image_b64,
-                            }
-                        },
-                    ]
+                    "parts": [{"text": prompt}]
                 }
             ]
         }
 
         response_json = self._generate_content(payload=payload)
-        raw_text = self._extract_text_from_response(response_json).strip()
+        raw_json = self._extract_text_from_response(response_json).strip()
+        parsed = self._parse_json(raw_json)
 
-        return OCRResult(
-            provider_name=self.name,
-            raw_text=raw_text,
-            blocks=[],
-            metadata={
-                "model_name": self._settings.model_name,
-                "mime_type": mime_type,
-            },
+        return self._build_invoice_data(parsed)
+
+    def _build_invoice_data(self, data: dict[str, Any]) -> InvoiceData:
+        """Convert parsed JSON dict into a validated InvoiceData object."""
+        line_items = [
+            InvoiceLineItem(
+                ten_vt_raw=item.get("ten_vt_raw"),
+                dvt=item.get("dvt"),
+                so_luong=item.get("so_luong"),
+                don_gia=Decimal(str(item["don_gia"])) if item.get("don_gia") is not None else None,
+                thue_suat_pct=item.get("thue_suat_pct"),
+                ma_vt=None,
+                ma_thue=None,
+                tk_kho=None,
+                ma_bp=None,
+                ma_da=None,
+                ghi_chu=item.get("ghi_chu"),
+            )
+            for item in data.get("line_items", [])
+        ]
+
+        ngay_hd_raw = data.get("ngay_hd")
+        ngay_hd = date.fromisoformat(ngay_hd_raw) if ngay_hd_raw else None
+
+        return InvoiceData(
+            ngay_hd=ngay_hd,
+            so_hd=data.get("so_hd"),
+            mst_ncc=data.get("mst_ncc"),
+            ten_ncc_raw=data.get("ten_ncc_raw"),
+            ma_ncc=None,
+            line_items=line_items,
         )
 
-    def _resolve_mime_type(self, path: Path) -> str:
-        """Detect MIME type from file extension, fall back to default."""
-        guessed, _ = mimetypes.guess_type(path.name)
-        return guessed if guessed else _DEFAULT_MIME_TYPE
+    def _parse_json(self, raw_json: str) -> dict[str, Any]:
+        """Strip markdown fences if present and parse JSON string."""
+        cleaned = raw_json.strip()
+        if cleaned.startswith("```"):
+            # Remove opening fence (```json or ```)
+            cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+        try:
+            return json.loads(cleaned.strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Gemini extractor returned invalid JSON: {exc}\nRaw response: {raw_json}"
+            ) from exc
 
     def _generate_content(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
@@ -159,6 +207,7 @@ class GeminiProvider:
 
     def _sleep_before_retry(self, attempt: int) -> None:
         """Exponential backoff before retrying a failed request."""
+        import time
         delay_seconds = self._INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
         time.sleep(delay_seconds)
 
