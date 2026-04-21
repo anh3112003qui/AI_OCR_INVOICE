@@ -41,4 +41,6 @@ data/tmp/
 data/output/
 
 # Jupyter
-.ipynb_checkpoints/
+.ipynb_checkpoints/data/
+*.Zone.Identifier
+data/

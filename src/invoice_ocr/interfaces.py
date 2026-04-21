@@ -4,6 +4,7 @@ from typing import Protocol, runtime_checkable
 
 from invoice_ocr.models import InvoiceData, OCRResult
 from invoice_ocr.types import ImagePath
+from invoice_ocr.validation import ValidationResult
 
 
 @runtime_checkable
@@ -56,5 +57,27 @@ class FieldExtractor(Protocol):
 
         Returns:
             InvoiceData with parsed and normalized invoice fields
+        """
+        ...
+
+
+@runtime_checkable
+class Validator(Protocol):
+    """
+    Contract for validating and normalizing extracted invoice data.
+
+    Any class implementing this interface must:
+    - Implement `validate` to return a ValidationResult
+    """
+
+    def validate(self, invoice: InvoiceData) -> ValidationResult:
+        """
+        Validate and normalize an InvoiceData object.
+
+        Args:
+            invoice: raw InvoiceData from a FieldExtractor
+
+        Returns:
+            ValidationResult containing normalized invoice, errors, and warnings
         """
         ...
